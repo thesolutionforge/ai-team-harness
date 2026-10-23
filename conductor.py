@@ -1,29 +1,38 @@
 """
-conductor.py - send one task to Claude and to Codex at the same time,
-wait for both (with a timeout), ask Claude to merge the two answers,
-and save everything under runs/<date-time>/.
+conductor.py - the AI team harness engine.
 
-Usage (PowerShell):
-    python conductor.py "Give 3 ideas for a cafe website homepage headline"
-    python conductor.py --timeout 120 "Some task"
+Sends one task to Claude and to Codex at the same time, waits for both
+(with a timeout), asks Claude to merge the two answers, and saves everything
+under runs/<date-time>/.
+
+Used two ways:
+  - from the command line:  python conductor.py "some task"
+  - imported by dashboard.py, which calls check_auth() and run_task().
 """
 
 import argparse
+import json
 import os
 import random
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
 # Folder this script lives in. Everything else is relative to it.
 HERE = Path(__file__).resolve().parent
+RUNS_DIR = HERE / "runs"
 
 # Codex gets its own settings folder so the desktop app's MCP servers,
 # plugins and hooks never load. Codex reads this from the CODEX_HOME variable.
 CODEX_HOME = HERE / ".codex-home"
+
+# Where the Codex installer puts codex.exe. Used as a fallback when the
+# program that launched us has an old PATH (e.g. an app opened before install).
+EXTRA_TOOL_DIRS = [Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "OpenAI" / "Codex" / "bin"]
 
 # Extra instruction for Claude: this is a one-shot run, not an interactive
 # session, so the "work in stages and wait for me" rule must not apply.
@@ -59,13 +68,23 @@ Two assistants were given the same task. Combine their answers.
 Write in plain Markdown. Do not guess or mention which AI wrote A or B.
 """
 
+# Shared options for every subprocess we start.
+PROC_OPTS = dict(cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                 text=True, encoding="utf-8", errors="replace")
+
 
 def find_tool(name):
-    """Return the full path of a command-line tool, or exit with a clear message."""
-    path = shutil.which(name)
+    """Return the full path of a command-line tool, or raise a clear error."""
+    search = os.pathsep.join([os.environ.get("PATH", "")] + [str(d) for d in EXTRA_TOOL_DIRS])
+    path = shutil.which(name, path=search)
     if path is None:
-        sys.exit(f"Cannot find '{name}' on PATH. Open a new terminal or install it.")
+        raise FileNotFoundError(f"Cannot find '{name}' on PATH. Open a new terminal or install it.")
     return path
+
+
+def codex_env():
+    """Environment for Codex: same as ours, plus its private settings folder."""
+    return dict(os.environ, CODEX_HOME=str(CODEX_HOME))
 
 
 def claude_command():
@@ -81,36 +100,74 @@ def claude_command():
     ]
 
 
-def start_claude(task):
-    """Launch Claude Code with the task on the command line."""
-    return subprocess.Popen(
-        claude_command() + [task], cwd=HERE,
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace",
-    )
+# ---------------------------------------------------------------------------
+# Sign-in checks (used by the dashboard cards)
+# ---------------------------------------------------------------------------
+
+def check_auth():
+    """Ask each CLI whether it is signed in. Returns a dict like
+    {"claude": {"ok": True, "detail": "..."}, "gpt": {"ok": False, "detail": "..."}}."""
+    result = {}
+
+    # Claude prints JSON with a loggedIn flag.
+    try:
+        out = subprocess.run([find_tool("claude"), "auth", "status"],
+                             timeout=30, **PROC_OPTS).stdout
+        info = json.loads(out)
+        if info.get("loggedIn"):
+            plan = info.get("subscriptionType", "")
+            detail = f"Signed in as {info.get('email', 'unknown')}" + (f" ({plan} plan)" if plan else "")
+            result["claude"] = {"ok": True, "detail": detail}
+        else:
+            result["claude"] = {"ok": False, "detail": "Not signed in. Run: claude auth login"}
+    except Exception as e:  # tool missing, timeout, bad JSON...
+        result["claude"] = {"ok": False, "detail": f"Check failed: {e}"}
+
+    # Codex prints a sentence and exits 0 when signed in.
+    try:
+        proc = subprocess.run([find_tool("codex"), "login", "status"],
+                              env=codex_env(), timeout=30, **PROC_OPTS)
+        text = (proc.stdout + proc.stderr).strip().splitlines()[-1] if (proc.stdout + proc.stderr).strip() else ""
+        if proc.returncode == 0 and "logged in" in text.lower() and "not logged" not in text.lower():
+            result["gpt"] = {"ok": True, "detail": f"{text}. Model {codex_model()}"}
+        else:
+            result["gpt"] = {"ok": False, "detail": "Not signed in. Run: codex login"}
+    except Exception as e:
+        result["gpt"] = {"ok": False, "detail": f"Check failed: {e}"}
+
+    return result
 
 
-def start_codex(task, answer_file):
-    """Launch Codex in exec mode. Its stdout is noisy, so we ask it to write
-    the final answer to a file (-o) and read that instead.
-    --ephemeral means Codex does not save this as a resumable session."""
-    env = dict(os.environ, CODEX_HOME=str(CODEX_HOME))
-    cmd = [
-        find_tool("codex"), "exec",
-        "--ephemeral",
-        "-o", str(answer_file),
-        task,
-    ]
-    return subprocess.Popen(
-        cmd, cwd=HERE, env=env,
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace",
-    )
+def codex_model():
+    """Read the model and effort from the harness Codex config, for display only."""
+    model, effort = "default", ""
+    try:
+        for line in (CODEX_HOME / "config.toml").read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() == "model":
+                model = value.strip().strip('"')
+            elif key.strip() == "model_reasoning_effort":
+                effort = value.strip().strip('"')
+    except OSError:
+        pass
+    return f"{model}, {effort} effort" if effort else model
 
 
-def wait_for(name, process, deadline, send=None):
+# ---------------------------------------------------------------------------
+# Running a task
+# ---------------------------------------------------------------------------
+
+def new_run_dir():
+    """Create and return a fresh folder like runs/2026-10-23_14-05-09/."""
+    run_dir = RUNS_DIR / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir.mkdir(parents=True)
+    return run_dir
+
+
+def wait_for(name, process, deadline, report, send=None):
     """Wait for a process until the deadline. `send` is optional text for its
     stdin (used for the long merge prompt). Returns (stdout, stderr, status)."""
+    report(name, "working")
     remaining = max(1, deadline - time.monotonic())
     try:
         out, err = process.communicate(input=send, timeout=remaining)
@@ -119,32 +176,93 @@ def wait_for(name, process, deadline, send=None):
         process.kill()                 # stop the slow one so the run can finish
         out, err = process.communicate()
         status = "TIMED OUT"
-    print(f"  {name}: {status}")
+    report(name, status)
     return out, err, status
 
 
-def merge_answers(task, claude_answer, gpt_answer, timeout):
-    """Third request: ask Claude to combine the two answers.
-    Which answer is A and which is B is chosen at random each run, so
-    neither AI always sits in the first position. Returns (text, mapping, log)."""
+def ask_claude(task, run_dir, deadline, report):
+    """Round 1, Claude: answer comes back on stdout, saved to claude.md.
+    The task goes in through stdin, so a task starting with "-" is never
+    mistaken for a command-line flag."""
+    process = subprocess.Popen(claude_command(), stdin=subprocess.PIPE, **PROC_OPTS)
+    out, err, status = wait_for("claude", process, deadline, report, send=task)
+    answer = out.strip() or f"(no answer: {status})"
+    (run_dir / "claude.md").write_text(answer + "\n", encoding="utf-8")
+    (run_dir / "claude.log").write_text(err, encoding="utf-8")
+    return answer, status
+
+
+def ask_codex(task, run_dir, deadline, report):
+    """Round 1, Codex: stdout is noisy, so it writes its final answer to gpt.md
+    (-o). --ephemeral means it does not save a resumable session."""
+    gpt_file = run_dir / "gpt.md"
+    cmd = [find_tool("codex"), "exec", "--ephemeral", "-o", str(gpt_file)]   # task comes via stdin
+    process = subprocess.Popen(cmd, env=codex_env(), stdin=subprocess.PIPE, **PROC_OPTS)
+    out, err, status = wait_for("gpt", process, deadline, report, send=task)
+    if gpt_file.exists() and gpt_file.read_text(encoding="utf-8").strip():
+        answer = gpt_file.read_text(encoding="utf-8").strip()
+    else:
+        answer = f"(no answer: {status})"
+        gpt_file.write_text(answer + "\n", encoding="utf-8")
+    (run_dir / "codex.log").write_text(out + "\n" + err, encoding="utf-8")
+    return answer, status
+
+
+def merge_answers(task, claude_answer, gpt_answer, run_dir, timeout, report):
+    """Round 2: ask Claude to combine the two answers. Which one is A and which
+    is B is chosen at random each run, so neither AI always sits first.
+    The mapping is appended to merged.md AFTER merging; the merger never sees it."""
     if random.random() < 0.5:
         a, b, mapping = claude_answer, gpt_answer, "Answer A = Claude, Answer B = GPT"
     else:
         a, b, mapping = gpt_answer, claude_answer, "Answer A = GPT, Answer B = Claude"
-
     prompt = MERGE_PROMPT.format(task=task, answer_a=a, answer_b=b)
 
     # The prompt is long, so it goes in through stdin instead of the command line.
-    process = subprocess.Popen(
-        claude_command(), cwd=HERE,
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace",
-    )
+    process = subprocess.Popen(claude_command(), stdin=subprocess.PIPE, **PROC_OPTS)
     deadline = time.monotonic() + timeout
-    out, err, status = wait_for("merge", process, deadline, send=prompt)
-    text = out.strip() or f"(no merged answer: {status})"
-    return text, mapping, err
+    out, err, status = wait_for("merge", process, deadline, report, send=prompt)
+    merged = (out.strip() or f"(no merged answer: {status})") + f"\n\n---\n*{mapping}*\n"
+    (run_dir / "merged.md").write_text(merged, encoding="utf-8")
+    (run_dir / "merge.log").write_text(err, encoding="utf-8")
+    return merged, status
 
+
+def run_task(task, timeout=300, report=None, run_dir=None):
+    """The whole pipeline. `report(step, status)` is called as things progress
+    (step is "claude", "gpt" or "merge"). Returns the run folder."""
+    report = report or (lambda step, status: None)
+    run_dir = run_dir or new_run_dir()
+    (run_dir / "task.md").write_text(task + "\n", encoding="utf-8")
+
+    # Round 1: both AIs at once. Each runs in its own thread so the slow one
+    # never blocks the fast one, and both share the same deadline.
+    deadline = time.monotonic() + timeout
+    results = {}
+    threads = [
+        threading.Thread(target=lambda: results.update(claude=ask_claude(task, run_dir, deadline, report))),
+        threading.Thread(target=lambda: results.update(gpt=ask_codex(task, run_dir, deadline, report))),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    claude_answer, claude_status = results["claude"]
+    gpt_answer, gpt_status = results["gpt"]
+
+    # Round 2: merge, but only if both answers actually arrived.
+    if claude_status == "ok" and gpt_status == "ok":
+        merge_answers(task, claude_answer, gpt_answer, run_dir, timeout, report)
+    else:
+        (run_dir / "merged.md").write_text(
+            "(merge skipped: one of the answers failed or timed out)\n", encoding="utf-8")
+        report("merge", "skipped")
+    return run_dir
+
+
+# ---------------------------------------------------------------------------
+# Command-line use
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description="Send one task to Claude and Codex, then merge.")
@@ -156,53 +274,9 @@ def main():
     # Windows consoles may not be UTF-8; make sure accents and quotes print fine.
     sys.stdout.reconfigure(encoding="utf-8")
 
-    # One folder per run, named by date and time, e.g. runs/2026-10-23_14-05-09/
-    run_dir = HERE / "runs" / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir.mkdir(parents=True)
-    (run_dir / "task.md").write_text(args.task + "\n", encoding="utf-8")
-    gpt_file = run_dir / "gpt.md"
-
-    # --- Step 1: both AIs answer the task in parallel -----------------------
-    print(f"Run folder: {run_dir}")
     print("Starting Claude and Codex...")
-    claude = start_claude(args.task)
-    codex = start_codex(args.task, gpt_file)
-
-    # Both are already running; now wait for each against the same deadline.
-    deadline = time.monotonic() + args.timeout
-    claude_out, claude_err, claude_status = wait_for("claude", claude, deadline)
-    codex_out, codex_err, codex_status = wait_for("codex", codex, deadline)
-
-    # Claude's answer is its stdout.
-    claude_answer = claude_out.strip() or f"(no answer: {claude_status})"
-    (run_dir / "claude.md").write_text(claude_answer + "\n", encoding="utf-8")
-
-    # Codex's answer is the file it wrote; if it never got there, say so.
-    if gpt_file.exists() and gpt_file.read_text(encoding="utf-8").strip():
-        gpt_answer = gpt_file.read_text(encoding="utf-8").strip()
-    else:
-        gpt_answer = f"(no answer: {codex_status})"
-        gpt_file.write_text(gpt_answer + "\n", encoding="utf-8")
-
-    # Keep the raw logs too; handy when something goes wrong.
-    (run_dir / "claude.log").write_text(claude_err, encoding="utf-8")
-    (run_dir / "codex.log").write_text(codex_out + "\n" + codex_err, encoding="utf-8")
-
-    # --- Step 2: merge --------------------------------------------------------
-    both_ok = claude_status == "ok" and codex_status == "ok"
-    if both_ok:
-        print("Merging...")
-        merged, mapping, merge_err = merge_answers(
-            args.task, claude_answer, gpt_answer, args.timeout)
-        # The mapping is appended AFTER merging, so the merger never saw it.
-        merged_file_text = f"{merged}\n\n---\n*{mapping}*\n"
-        (run_dir / "merge.log").write_text(merge_err, encoding="utf-8")
-    else:
-        merged = "(merge skipped: one of the answers failed or timed out)"
-        merged_file_text = merged + "\n"
-    (run_dir / "merged.md").write_text(merged_file_text, encoding="utf-8")
-
-    print("\n=== MERGED ===\n" + merged_file_text)
+    run_dir = run_task(args.task, args.timeout, report=lambda step, status: print(f"  {step}: {status}"))
+    print("\n=== MERGED ===\n" + (run_dir / "merged.md").read_text(encoding="utf-8"))
     print(f"Saved to {run_dir}")
 
 

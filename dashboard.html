@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI team</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<!-- Secret token from the server; sent back with every API call so other websites cannot use our API. -->
+<meta name="token" content="__TOKEN__">
+<!-- Markdown renderer plus DOMPurify, which strips scripts from the rendered HTML.
+     If either cannot load (offline), answers show as plain text. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.2/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
+<style>
+  /* ---- tokens: one place for colour, type and spacing ---- */
+  :root {
+    --bg: #141925;        /* page */
+    --panel: #1B2130;     /* cards and sidebar */
+    --panel-2: #222A3B;   /* inputs, tab strip */
+    --line: #2C3547;
+    --text: #E8EBF2;
+    --muted: #8B94A8;
+    --claude: #E3A95B;    /* amber: everything about Claude */
+    --gpt: #5CC4B8;       /* teal: everything about GPT */
+    --merge: #B59CF5;     /* violet: the merged answer */
+    --ok: #6FCF8E;
+    --bad: #F07A7A;
+    --radius: 10px;
+    --font: "Instrument Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 15px/1.5 var(--font); -webkit-font-smoothing: antialiased;
+    display: grid; grid-template-columns: 260px 1fr; min-height: 100vh;
+  }
+  h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -0.01em; }
+  button { font: inherit; cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--merge); outline-offset: 2px; }
+
+  /* ---- sidebar: recent runs ---- */
+  aside { background: var(--panel); border-right: 1px solid var(--line); padding: 28px 20px; overflow-y: auto; }
+  aside h1 { font-size: 20px; margin-bottom: 4px; }
+  aside .sub { color: var(--muted); font-size: 13px; margin-bottom: 28px; }
+  aside h2 { font-size: 13px; font-weight: 500; color: var(--muted); margin-bottom: 10px; }
+  .runs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+  .runs button {
+    width: 100%; text-align: left; background: none; border: 0; color: var(--text);
+    padding: 9px 10px; border-radius: 6px; display: grid; gap: 2px;
+  }
+  .runs button:hover { background: var(--panel-2); }
+  .runs button.active { background: var(--panel-2); box-shadow: inset 3px 0 0 var(--merge); }
+  .runs .when { color: var(--muted); font-size: 12px; }
+  .runs .what { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .empty { color: var(--muted); font-size: 14px; }
+
+  /* ---- main column ---- */
+  main { padding: 28px 36px 48px; max-width: 980px; width: 100%; }
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 22px; }
+  .card {
+    background: var(--panel); border-radius: var(--radius); padding: 16px 18px;
+    border-top: 3px solid var(--who);
+  }
+  .card.claude { --who: var(--claude); }
+  .card.gpt { --who: var(--gpt); }
+  .card h3 { font-size: 16px; display: flex; align-items: center; justify-content: space-between; }
+  .card p { margin: 6px 0 0; color: var(--muted); font-size: 13px; }
+  .pill { font-size: 12px; font-weight: 500; padding: 2px 9px; border-radius: 999px; background: var(--panel-2); color: var(--muted); }
+  .pill.ok { color: var(--ok); background: rgba(111,207,142,.12); }
+  .pill.bad { color: var(--bad); background: rgba(240,122,122,.12); }
+
+  /* ---- task box ---- */
+  .task { background: var(--panel); border-radius: var(--radius); padding: 16px 18px; margin-bottom: 22px; }
+  .task label { display: block; font-size: 14px; font-weight: 500; margin-bottom: 8px; }
+  textarea {
+    width: 100%; min-height: 84px; resize: vertical; font: inherit; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px;
+  }
+  textarea:focus { border-color: var(--muted); outline: none; }
+  .task .row { display: flex; align-items: center; justify-content: space-between; margin-top: 10px; gap: 12px; }
+  .task .hint { color: var(--muted); font-size: 13px; }
+  .run-btn {
+    background: var(--text); color: var(--bg); border: 0; border-radius: 6px;
+    padding: 9px 18px; font-weight: 600;
+  }
+  .run-btn:hover { background: #fff; }
+  .run-btn:disabled { opacity: .5; cursor: default; }
+
+  /* ---- lanes: the live status of the three steps ---- */
+  .lanes { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 18px; }
+  .lane {
+    background: var(--panel); border-radius: var(--radius); padding: 12px 14px;
+    display: grid; grid-template-columns: auto 1fr; column-gap: 10px; align-items: center;
+  }
+  .lane .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line); }
+  .lane .name { font-weight: 500; font-size: 14px; }
+  .lane .state { grid-column: 2; color: var(--muted); font-size: 13px; }
+  .lane.claude .dot.working, .lane.claude .dot.ok { background: var(--claude); }
+  .lane.gpt .dot.working, .lane.gpt .dot.ok { background: var(--gpt); }
+  .lane.merge .dot.working, .lane.merge .dot.ok { background: var(--merge); }
+  .lane .dot.bad { background: var(--bad); }
+  .lane .dot.working { animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(.75); } }
+  @media (prefers-reduced-motion: reduce) { .lane .dot.working { animation: none; opacity: .7; } }
+
+  /* ---- tabs and answer panel ---- */
+  .tabs { display: flex; gap: 4px; background: var(--panel-2); padding: 4px; border-radius: 8px; width: max-content; margin-bottom: 14px; }
+  .tabs button {
+    background: none; border: 0; color: var(--muted); padding: 7px 16px; border-radius: 6px; font-weight: 500;
+  }
+  .tabs button:hover { color: var(--text); }
+  .tabs button[aria-selected="true"] { background: var(--panel); color: var(--text); box-shadow: inset 0 -2px 0 var(--who); }
+  .tabs .claude { --who: var(--claude); } .tabs .gpt { --who: var(--gpt); } .tabs .merge { --who: var(--merge); }
+  .answer {
+    background: var(--panel); border-radius: var(--radius); padding: 22px 26px; min-height: 180px;
+    max-width: 72ch; overflow-wrap: anywhere;
+  }
+  .answer.placeholder { color: var(--muted); }
+  .answer h1 { font-size: 20px; margin: 0 0 12px; }
+  .answer h2 { font-size: 17px; margin: 22px 0 8px; }
+  .answer h3 { font-size: 15px; margin: 16px 0 6px; }
+  .answer p { margin: 0 0 12px; }
+  .answer ul, .answer ol { padding-left: 22px; margin: 0 0 12px; }
+  .answer li { margin-bottom: 4px; }
+  .answer blockquote { margin: 0 0 12px; padding-left: 14px; border-left: 3px solid var(--line); color: var(--muted); }
+  .answer hr { border: 0; border-top: 1px solid var(--line); margin: 18px 0; }
+  .answer pre { background: var(--panel-2); padding: 12px; border-radius: 6px; overflow-x: auto; }
+  .answer code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+  .answer pre code { background: none; padding: 0; }
+
+  @media (max-width: 820px) {
+    body { grid-template-columns: 1fr; }
+    aside { border-right: 0; border-bottom: 1px solid var(--line); }
+    main { padding: 20px 16px 40px; }
+    .cards, .lanes { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<aside>
+  <h1>AI team</h1>
+  <div class="sub">Claude and GPT answer, Claude merges.</div>
+  <h2>Recent runs</h2>
+  <ul class="runs" id="runs"></ul>
+  <div class="empty" id="runs-empty" hidden>No runs yet. Start one on the right.</div>
+</aside>
+
+<main>
+  <section class="cards" aria-label="Sign-in status">
+    <div class="card claude">
+      <h3>Claude <span class="pill" id="claude-pill">Checking</span></h3>
+      <p id="claude-detail">Looking up sign-in status.</p>
+    </div>
+    <div class="card gpt">
+      <h3>GPT <span class="pill" id="gpt-pill">Checking</span></h3>
+      <p id="gpt-detail">Looking up sign-in status.</p>
+    </div>
+  </section>
+
+  <section class="task">
+    <label for="task">Task</label>
+    <textarea id="task" placeholder="What should both AIs work on?"></textarea>
+    <div class="row">
+      <span class="hint" id="hint">Each step may take up to 5 minutes.</span>
+      <button class="run-btn" id="run">Run</button>
+    </div>
+  </section>
+
+  <section class="lanes" aria-label="Progress">
+    <div class="lane claude"><span class="dot" id="lane-claude-dot"></span><span class="name">Claude</span><span class="state" id="lane-claude">Waiting</span></div>
+    <div class="lane gpt"><span class="dot" id="lane-gpt-dot"></span><span class="name">GPT</span><span class="state" id="lane-gpt">Waiting</span></div>
+    <div class="lane merge"><span class="dot" id="lane-merge-dot"></span><span class="name">Merge</span><span class="state" id="lane-merge">Waiting</span></div>
+  </section>
+
+  <div class="tabs" role="tablist">
+    <button class="claude" role="tab" data-tab="claude" aria-selected="false">Claude's answer</button>
+    <button class="gpt" role="tab" data-tab="gpt" aria-selected="false">GPT's answer</button>
+    <button class="merge" role="tab" data-tab="merged" aria-selected="true">Merged</button>
+  </div>
+  <article class="answer placeholder" id="answer">Run a task or pick a recent run to see answers here.</article>
+</main>
+
+<script nonce="__NONCE__">
+  // ---- small helpers ----
+  const $ = (id) => document.getElementById(id);
+  const TOKEN = document.querySelector("meta[name=token]").content;
+  const api = (path, options = {}) => fetch(path, {
+    ...options, headers: { ...(options.headers || {}), "X-Auth-Token": TOKEN },
+  }).then(r => r.json());
+  let current = null;        // the run being shown
+  let currentData = null;    // its latest details from the server
+  let activeTab = "merged";
+  let ticker = null;         // repaints the elapsed seconds while a run is working
+
+  // ---- sign-in cards ----
+  async function loadStatus() {
+    const status = await api("/api/status");
+    for (const who of ["claude", "gpt"]) {
+      const s = status[who];
+      $(who + "-pill").textContent = s.ok ? "Signed in" : "Not signed in";
+      $(who + "-pill").className = "pill " + (s.ok ? "ok" : "bad");
+      $(who + "-detail").textContent = s.detail;
+    }
+  }
+
+  // ---- recent runs sidebar ----
+  function prettyTime(id) {
+    // "2026-10-23_14-08-21" -> "23 Oct, 14:08"
+    const [d, t] = id.split("_");
+    const date = new Date(d + "T" + t.replace(/-/g, ":"));
+    return isNaN(date) ? id : date.toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+  }
+  async function loadRuns() {
+    const runs = await api("/api/runs");
+    $("runs-empty").hidden = runs.length > 0;
+    $("runs").innerHTML = "";
+    for (const run of runs) {
+      const li = document.createElement("li");
+      const btn = document.createElement("button");
+      btn.className = run.id === current ? "active" : "";
+      btn.innerHTML = `<span class="when">${prettyTime(run.id)}</span><span class="what"></span>`;
+      btn.querySelector(".what").textContent = run.task;
+      btn.onclick = () => showRun(run.id);
+      li.appendChild(btn);
+      $("runs").appendChild(li);
+    }
+  }
+
+  // ---- starting a run ----
+  $("run").onclick = async () => {
+    const task = $("task").value.trim();
+    if (!task) { $("task").focus(); return; }
+    $("run").disabled = true;
+    const res = await api("/api/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task }) });
+    if (res.error) { alert(res.error); $("run").disabled = false; return; }
+    current = res.id;
+    loadRuns();
+    poll();
+  };
+
+  // Ask the server for progress every second until the run is finished.
+  async function poll() {
+    const data = await api("/api/runs/" + current);
+    currentData = data;
+    render(data);
+    if (data.live && !data.live.done) {
+      setTimeout(poll, 1000);
+    } else {
+      $("run").disabled = false;
+      loadRuns();
+    }
+  }
+
+  // ---- showing a run (live or from the folder) ----
+  async function showRun(id) {
+    current = id;
+    currentData = await api("/api/runs/" + id);
+    render(currentData);
+    loadRuns();
+    if (currentData.live && !currentData.live.done) { $("run").disabled = true; poll(); }
+  }
+
+  function render(data) {
+    if (data.task) $("task").value = data.task.trim();
+    renderLanes(data);
+    renderAnswer(data);
+  }
+
+  function renderLanes(data) {
+    clearInterval(ticker);
+    const live = data.live;
+    let anyWorking = false;
+    for (const step of ["claude", "gpt", "merge"]) {
+      const dot = $("lane-" + step + "-dot"), text = $("lane-" + step);
+      let status, started, ended;
+      if (live) {
+        ({ status, started, ended } = live.steps[step]);
+      } else {
+        // Older run: no live data, so judge from the files.
+        const file = step === "merge" ? data.merged : data[step];
+        status = file ? (file.startsWith("(") ? "failed" : "ok") : "waiting";
+      }
+      let cls = "dot", label = "Waiting";
+      if (status === "working") { cls += " working"; anyWorking = true; label = "Working, " + elapsed(started) + "s"; }
+      else if (status === "ok") { cls += " ok"; label = started && ended ? "Done in " + Math.round(ended - started) + "s" : "Done"; }
+      else if (status === "skipped") { label = "Skipped"; }
+      else if (status !== "waiting") { cls += " bad"; label = status === "failed" ? "Failed" : status; }
+      dot.className = cls;
+      text.textContent = label;
+    }
+    if (anyWorking) ticker = setInterval(() => renderLanes(currentData), 1000);
+  }
+  const elapsed = (started) => Math.max(0, Math.round(Date.now() / 1000 - started));
+
+  function renderAnswer(data) {
+    const text = data[activeTab];
+    const box = $("answer");
+    if (!text) {
+      box.className = "answer placeholder";
+      const live = data.live && data.live.steps[activeTab === "merged" ? "merge" : activeTab];
+      box.textContent = live && live.status === "working" ? "Working on it." : "Nothing here yet.";
+      return;
+    }
+    box.className = "answer";
+    if (window.marked && window.DOMPurify) box.innerHTML = DOMPurify.sanitize(marked.parse(text));
+    else { box.textContent = text; box.style.whiteSpace = "pre-wrap"; }   // never insert unsanitised HTML
+  }
+
+  // ---- tabs ----
+  for (const tab of document.querySelectorAll("[role=tab]")) {
+    tab.onclick = () => {
+      activeTab = tab.dataset.tab;
+      document.querySelectorAll("[role=tab]").forEach(t => t.setAttribute("aria-selected", t === tab));
+      if (currentData) renderAnswer(currentData);
+    };
+  }
+
+  // ---- first paint ----
+  loadStatus();
+  loadRuns();
+</script>
+</body>
+</html>
