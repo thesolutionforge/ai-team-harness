@@ -31,7 +31,7 @@ HOST = "127.0.0.1"          # loopback only: never reachable from other machines
 PORT = 8765
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "dashboard.html"
-SETTINGS = HERE / "settings.json"   # remembers your last role choices
+SETTINGS = HERE / "settings.json"   # remembers your last choices (roles, mode, rounds)
 
 # New random token each time the server starts. The page receives it in a
 # <meta> tag and sends it back with every API call. Other sites never see it.
@@ -54,6 +54,7 @@ def set_port(port):
 set_port(PORT)
 
 MAX_ROLE_TEXT = 2000        # characters allowed in a custom role description
+MODES = ("together", "debate")
 
 # Progress of runs started from the page, keyed by run folder name.
 # Each entry: {"task": str, "steps": {"claude": {...}, "gpt": {...}, "merge": {...}}, "done": bool}
@@ -61,15 +62,22 @@ LIVE = {}
 
 
 # ---------------------------------------------------------------------------
-# Roles and settings
+# Settings (your last choices) and input cleaning
 # ---------------------------------------------------------------------------
 
+def default_settings():
+    return {"roles": {"claude": conductor.no_role(), "gpt": conductor.no_role()},
+            "mode": "together", "critique_rounds": 1}
+
+
 def load_settings():
-    """Your remembered choices, or defaults (both General) the first time."""
+    """Your remembered choices, with defaults filled in for anything missing."""
+    settings = default_settings()
     try:
-        return json.loads(SETTINGS.read_text(encoding="utf-8"))
+        settings.update(json.loads(SETTINGS.read_text(encoding="utf-8")))
     except (OSError, ValueError):
-        return {"roles": {"claude": conductor.no_role(), "gpt": conductor.no_role()}}
+        pass
+    return settings
 
 
 def save_settings(settings):
@@ -91,30 +99,41 @@ def clean_role(raw, presets):
     return conductor.no_role()
 
 
+def clean_mode(raw):
+    return raw if raw in MODES else "together"
+
+
+def clean_rounds(raw):
+    return raw if raw in (1, 2) else 1
+
+
 # ---------------------------------------------------------------------------
 # Runs
 # ---------------------------------------------------------------------------
 
-def start_run(task, timeout, roles):
+def start_run(task, timeout, roles, mode, critique_rounds):
     """Create the run folder, then run the pipeline in a background thread
     so the web server stays responsive while the AIs work."""
     run_dir = conductor.new_run_dir()
     run_id = run_dir.name
-    LIVE[run_id] = {"task": task, "done": False,
-                    "steps": {s: {"status": "waiting"} for s in ("claude", "gpt", "merge")}}
+    LIVE[run_id] = {"task": task, "done": False, "mode": mode,
+                    "steps": {s: {"status": "waiting", "label": ""} for s in ("claude", "gpt", "merge")}}
 
-    def report(step, status):
-        # Called by conductor as each step starts and finishes.
+    def report(step, status, label=""):
+        # Called by conductor as each step starts and finishes a round.
         entry = LIVE[run_id]["steps"][step]
         entry["status"] = status
+        entry["label"] = label
         if status == "working":
             entry["started"] = time.time()
+            entry.pop("ended", None)
         else:
             entry["ended"] = time.time()
 
     def work():
         try:
-            conductor.run_task(task, timeout, report=report, run_dir=run_dir, roles=roles)
+            conductor.run_task(task, timeout, report=report, run_dir=run_dir,
+                               roles=roles, mode=mode, critique_rounds=critique_rounds)
         except Exception as e:                      # e.g. a CLI is missing
             for step in LIVE[run_id]["steps"].values():
                 if step["status"] in ("waiting", "working"):
@@ -131,13 +150,23 @@ def read_file(folder, name):
     return path.read_text(encoding="utf-8") if path.exists() else None
 
 
-def read_roles(folder):
-    """Roles saved with a run, or None for runs made before roles existed."""
-    text = read_file(folder, "roles-used.json")
-    try:
-        return json.loads(text) if text else None
-    except ValueError:
-        return None
+def read_info(folder):
+    """Mode, rounds and roles saved with a run. Older runs only have
+    roles-used.json (or nothing); fill in sensible defaults for them."""
+    info = {"mode": "together", "critique_rounds": 0, "roles": None}
+    for name in ("run-info.json", "roles-used.json"):
+        text = read_file(folder, name)
+        if text:
+            try:
+                data = json.loads(text)
+            except ValueError:
+                continue
+            if name == "run-info.json":
+                info.update(data)
+            else:
+                info["roles"] = data
+            break
+    return info
 
 
 def list_runs():
@@ -149,7 +178,7 @@ def list_runs():
         task = read_file(folder, "task.md")
         if folder.is_dir() and task:
             runs.append({"id": folder.name, "task": task.strip().splitlines()[0],
-                         "merged": (folder / "merged.md").exists()})
+                         "mode": read_info(folder)["mode"]})
     return runs
 
 
@@ -158,13 +187,17 @@ def run_details(run_id):
     folder = conductor.RUNS_DIR / run_id
     if not folder.is_dir():
         return None
+    info = read_info(folder)
     return {
         "id": run_id,
         "task": read_file(folder, "task.md"),
-        "roles": read_roles(folder),
+        "mode": info["mode"],
+        "critique_rounds": info["critique_rounds"],
+        "roles": info["roles"],
         "claude": read_file(folder, "claude.md"),
         "gpt": read_file(folder, "gpt.md"),
         "merged": read_file(folder, "merged.md"),
+        "debate": read_file(folder, "debate.md"),
         "live": LIVE.get(run_id),      # None for runs from before this server started
     }
 
@@ -225,7 +258,8 @@ class Handler(BaseHTTPRequestHandler):
             return None
         length = int(self.headers.get("Content-Length", 0))
         try:
-            return json.loads(self.rfile.read(length) or b"{}")
+            data = json.loads(self.rfile.read(length) or b"{}")
+            return data if isinstance(data, dict) else None
         except ValueError:
             return None
 
@@ -236,9 +270,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_page()
         elif self.path == "/api/status":
             self.send_json(conductor.check_auth())
-        elif self.path == "/api/roles":
-            # Presets for the dropdowns plus your last choices.
-            self.send_json({"presets": conductor.load_roles(), "last": load_settings()["roles"]})
+        elif self.path == "/api/settings":
+            # Role presets for the dropdowns plus your last choices.
+            self.send_json({"presets": conductor.load_roles(), "last": load_settings()})
         elif self.path == "/api/runs":
             self.send_json(list_runs())
         elif self.path.startswith("/api/runs/"):
@@ -262,11 +296,13 @@ class Handler(BaseHTTPRequestHandler):
             if not task:
                 return self.send_json({"error": "Type a task first."}, 400)
             presets = conductor.load_roles()
-            raw = data.get("roles") or {}
+            raw = data.get("roles") if isinstance(data.get("roles"), dict) else {}
             roles = {"claude": clean_role(raw.get("claude"), presets),
                      "gpt": clean_role(raw.get("gpt"), presets)}
-            save_settings({"roles": roles})          # remember for next time
-            run_id = start_run(task, int(data.get("timeout") or 300), roles)
+            mode = clean_mode(data.get("mode"))
+            rounds = clean_rounds(data.get("critique_rounds"))
+            save_settings({"roles": roles, "mode": mode, "critique_rounds": rounds})   # remember for next time
+            run_id = start_run(task, int(data.get("timeout") or 300), roles, mode, rounds)
             self.send_json({"id": run_id})
         else:
             self.send_json({"error": "not found"}, 404)

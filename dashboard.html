@@ -53,7 +53,7 @@
   }
   .runs button:hover { background: var(--panel-2); }
   .runs button.active { background: var(--panel-2); box-shadow: inset 3px 0 0 var(--merge); }
-  .runs .when { color: var(--muted); font-size: 12px; }
+  .runs .when { color: var(--muted); font-size: 12px; display: flex; justify-content: space-between; }
   .runs .what { font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .empty { color: var(--muted); font-size: 14px; }
 
@@ -76,13 +76,25 @@
   .role { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
   .role label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; }
   select {
-    width: 100%; color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
+    color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
     border-radius: 6px; padding: 7px 10px;
   }
-  select:focus { border-color: var(--who); outline: none; }
+  .role select { width: 100%; }
+  select:focus { border-color: var(--who, var(--muted)); outline: none; }
   .role .desc { margin: 8px 0 0; color: var(--muted); font-size: 13px; min-height: 1.5em; }
   .role textarea { margin-top: 8px; min-height: 64px; }
   .role textarea:focus { border-color: var(--who); }
+
+  /* ---- mode: work together or debate ---- */
+  .mode { background: var(--panel); border-radius: var(--radius); padding: 14px 18px; margin-bottom: 14px;
+          display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .mode .label { font-size: 14px; font-weight: 500; }
+  .seg { display: flex; gap: 4px; background: var(--panel-2); padding: 4px; border-radius: 8px; }
+  .seg button { background: none; border: 0; color: var(--muted); padding: 6px 14px; border-radius: 6px; font-weight: 500; }
+  .seg button:hover { color: var(--text); }
+  .seg button[aria-pressed="true"] { background: var(--panel); color: var(--text); box-shadow: inset 0 -2px 0 var(--merge); }
+  .mode .rounds { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+  .mode .note { flex-basis: 100%; color: var(--muted); font-size: 13px; margin: 0; }
 
   /* ---- task box ---- */
   .task { background: var(--panel); border-radius: var(--radius); padding: 16px 18px; margin-bottom: 22px; }
@@ -126,13 +138,15 @@
   }
   .tabs button:hover { color: var(--text); }
   .tabs button[aria-selected="true"] { background: var(--panel); color: var(--text); box-shadow: inset 0 -2px 0 var(--who); }
-  .tabs .claude { --who: var(--claude); } .tabs .gpt { --who: var(--gpt); } .tabs .merge { --who: var(--merge); }
+  .tabs .claude { --who: var(--claude); } .tabs .gpt { --who: var(--gpt); }
+  .tabs .merge { --who: var(--merge); } .tabs .debate { --who: var(--muted); }
   .answer {
     background: var(--panel); border-radius: var(--radius); padding: 22px 26px; min-height: 180px;
     max-width: 72ch; overflow-wrap: anywhere;
   }
   .answer.placeholder { color: var(--muted); }
   .answer h1 { font-size: 20px; margin: 0 0 12px; }
+  .answer h1 + h1, .answer * + h1 { margin-top: 30px; padding-top: 18px; border-top: 1px solid var(--line); }
   .answer h2 { font-size: 17px; margin: 22px 0 8px; }
   .answer h3 { font-size: 15px; margin: 16px 0 6px; }
   .answer p { margin: 0 0 12px; }
@@ -143,6 +157,8 @@
   .answer pre { background: var(--panel-2); padding: 12px; border-radius: 6px; overflow-x: auto; }
   .answer code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 13px; }
   .answer pre code { background: none; padding: 0; }
+  .answer table { border-collapse: collapse; margin: 0 0 12px; font-size: 14px; }
+  .answer th, .answer td { border: 1px solid var(--line); padding: 6px 10px; text-align: left; vertical-align: top; }
 
   @media (max-width: 820px) {
     body { grid-template-columns: 1fr; }
@@ -186,6 +202,19 @@
     </div>
   </section>
 
+  <section class="mode" aria-label="Mode">
+    <span class="label">Mode</span>
+    <div class="seg" role="group" aria-label="Mode">
+      <button type="button" data-mode="together" aria-pressed="true">Work together</button>
+      <button type="button" data-mode="debate" aria-pressed="false">Debate</button>
+    </div>
+    <div class="rounds" id="rounds-box" hidden>
+      <label for="rounds">Critique rounds</label>
+      <select id="rounds"><option value="1">1</option><option value="2">2</option></select>
+    </div>
+    <p class="note" id="mode-note">Both answer, then Claude merges the two answers.</p>
+  </section>
+
   <section class="task">
     <label for="task">Task</label>
     <textarea id="task" placeholder="What should both AIs work on?"></textarea>
@@ -204,6 +233,7 @@
   <div class="tabs" role="tablist">
     <button class="claude" role="tab" data-tab="claude" aria-selected="false">Claude's answer</button>
     <button class="gpt" role="tab" data-tab="gpt" aria-selected="false">GPT's answer</button>
+    <button class="debate" role="tab" data-tab="debate" aria-selected="false">Debate</button>
     <button class="merge" role="tab" data-tab="merged" aria-selected="true">Merged</button>
   </div>
   <article class="answer placeholder" id="answer">Run a task or pick a recent run to see answers here.</article>
@@ -221,6 +251,13 @@
   let activeTab = "merged";
   let ticker = null;         // repaints the elapsed seconds while a run is working
   let presets = {};          // role name -> instruction text, from roles.json
+  let mode = "together";
+
+  const MODE_NOTES = {
+    together: "Both answer, then Claude merges the two answers.",
+    debate: "Both answer, each critiques the other and revises, then Claude merges. " +
+            "Debate takes longer and uses more of your plan allowance than Work together.",
+  };
 
   // ---- sign-in cards ----
   async function loadStatus() {
@@ -233,9 +270,9 @@
     }
   }
 
-  // ---- roles ----
-  async function loadRoles() {
-    const data = await api("/api/roles");
+  // ---- settings: roles, mode, rounds (restored from your last run) ----
+  async function loadSettings() {
+    const data = await api("/api/settings");
     presets = data.presets;
     for (const who of ["claude", "gpt"]) {
       const select = $(who + "-role");
@@ -245,13 +282,14 @@
         opt.value = name; opt.textContent = name;
         select.appendChild(opt);
       }
-      // Restore the last choice (defaults to General on first use).
-      const last = data.last[who] || { name: "General", text: "" };
+      const last = (data.last.roles || {})[who] || { name: "General", text: "" };
       select.value = presets[last.name] !== undefined || last.name === "Custom" ? last.name : "General";
       if (last.name === "Custom") $(who + "-role-custom").value = last.text;
       select.onchange = () => showRoleText(who);
       showRoleText(who);
     }
+    setMode(data.last.mode === "debate" ? "debate" : "together");
+    $("rounds").value = data.last.critique_rounds === 2 ? "2" : "1";
   }
   function showRoleText(who) {
     // Show the preset's instruction under the dropdown, or the custom box.
@@ -264,6 +302,13 @@
     const name = $(who + "-role").value;
     return { name, text: name === "Custom" ? $(who + "-role-custom").value.trim() : (presets[name] || "") };
   }
+  function setMode(m) {
+    mode = m;
+    document.querySelectorAll("[data-mode]").forEach(b => b.setAttribute("aria-pressed", b.dataset.mode === m));
+    $("rounds-box").hidden = m !== "debate";
+    $("mode-note").textContent = MODE_NOTES[m];
+  }
+  document.querySelectorAll("[data-mode]").forEach(b => b.onclick = () => setMode(b.dataset.mode));
 
   // ---- recent runs sidebar ----
   function prettyTime(id) {
@@ -280,7 +325,9 @@
       const li = document.createElement("li");
       const btn = document.createElement("button");
       btn.className = run.id === current ? "active" : "";
-      btn.innerHTML = `<span class="when">${prettyTime(run.id)}</span><span class="what"></span>`;
+      btn.innerHTML = `<span class="when"><span></span><span></span></span><span class="what"></span>`;
+      btn.querySelector(".when span:first-child").textContent = prettyTime(run.id);
+      btn.querySelector(".when span:last-child").textContent = run.mode === "debate" ? "Debate" : "";
       btn.querySelector(".what").textContent = run.task;
       btn.onclick = () => showRun(run.id);
       li.appendChild(btn);
@@ -293,7 +340,10 @@
     const task = $("task").value.trim();
     if (!task) { $("task").focus(); return; }
     $("run").disabled = true;
-    const body = { task, roles: { claude: chosenRole("claude"), gpt: chosenRole("gpt") } };
+    const body = {
+      task, mode, critique_rounds: Number($("rounds").value),
+      roles: { claude: chosenRole("claude"), gpt: chosenRole("gpt") },
+    };
     const res = await api("/api/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     if (res.error) { alert(res.error); $("run").disabled = false; return; }
     current = res.id;
@@ -340,33 +390,43 @@
     }
     for (const step of ["claude", "gpt", "merge"]) {
       const dot = $("lane-" + step + "-dot"), text = $("lane-" + step);
-      let status, started, ended;
+      let status, started, ended, label = "";
       if (live) {
-        ({ status, started, ended } = live.steps[step]);
+        ({ status, started, ended, label = "" } = live.steps[step]);
       } else {
         // Older run: no live data, so judge from the files.
         const file = step === "merge" ? data.merged : data[step];
         status = file ? (file.startsWith("(") ? "failed" : "ok") : "waiting";
       }
-      let cls = "dot", label = "Waiting";
-      if (status === "working") { cls += " working"; anyWorking = true; label = "Working, " + elapsed(started) + "s"; }
-      else if (status === "ok") { cls += " ok"; label = started && ended ? "Done in " + Math.round(ended - started) + "s" : "Done"; }
-      else if (status === "skipped") { label = "Skipped"; }
-      else if (status !== "waiting") { cls += " bad"; label = status === "failed" ? "Failed" : status; }
+      // In debate mode the label names the round, e.g. "Critique 1".
+      const prefix = label ? label + ": " : "";
+      let cls = "dot", text_ = "Waiting";
+      if (status === "working") { cls += " working"; anyWorking = true; text_ = prefix + "working, " + elapsed(started) + "s"; }
+      else if (status === "ok") { cls += " ok"; text_ = prefix + (started && ended ? "done in " + Math.round(ended - started) + "s" : "done"); }
+      else if (status === "skipped") { text_ = "Skipped"; }
+      else if (status !== "waiting") { cls += " bad"; text_ = prefix + (status === "failed" ? "failed" : status); }
       dot.className = cls;
-      text.textContent = label;
+      text.textContent = text_.charAt(0).toUpperCase() + text_.slice(1);
     }
     if (anyWorking) ticker = setInterval(() => renderLanes(currentData), 1000);
   }
   const elapsed = (started) => Math.max(0, Math.round(Date.now() / 1000 - started));
 
   function renderAnswer(data) {
-    const text = data[activeTab];
     const box = $("answer");
+    if (activeTab === "debate" && data.mode !== "debate") {
+      box.className = "answer placeholder";
+      box.textContent = "This run used Work together, so there was no debate.";
+      return;
+    }
+    const text = data[activeTab];
     if (!text) {
       box.className = "answer placeholder";
-      const live = data.live && data.live.steps[activeTab === "merged" ? "merge" : activeTab];
-      box.textContent = live && live.status === "working" ? "Working on it." : "Nothing here yet.";
+      const step = activeTab === "merged" ? "merge" : activeTab;
+      const live = data.live && data.live.steps[step];
+      box.textContent = live && live.status === "working" ? "Working on it."
+                      : activeTab === "debate" ? "The debate appears here once the critique round is done."
+                      : "Nothing here yet.";
       return;
     }
     box.className = "answer";
@@ -385,7 +445,7 @@
 
   // ---- first paint ----
   loadStatus();
-  loadRoles();
+  loadSettings();
   loadRuns();
 </script>
 </body>
