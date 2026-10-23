@@ -15,6 +15,7 @@
 <style>
   /* ---- tokens: one place for colour, type and spacing ---- */
   :root {
+    color-scheme: dark;   /* native dropdown lists and scrollbars follow the dark theme */
     --bg: #141925;        /* page */
     --panel: #1B2130;     /* cards and sidebar */
     --panel-2: #222A3B;   /* inputs, tab strip */
@@ -30,6 +31,7 @@
     --font: "Instrument Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   html, body { margin: 0; height: 100%; }
   body {
     background: var(--bg); color: var(--text);
@@ -59,6 +61,8 @@
 
   /* ---- main column ---- */
   main { padding: 28px 36px 48px; max-width: 980px; width: 100%; }
+  .problem { background: rgba(240,122,122,.12); color: var(--bad); border-radius: var(--radius);
+             padding: 12px 16px; margin-bottom: 18px; font-size: 14px; }
   .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 22px; }
   .card {
     background: var(--panel); border-radius: var(--radius); padding: 16px 18px;
@@ -80,6 +84,7 @@
     border-radius: 6px; padding: 7px 10px;
   }
   .role select { width: 100%; }
+  select option { color: var(--text); background: var(--panel-2); }
   select:focus { border-color: var(--who, var(--muted)); outline: none; }
   .role .desc { margin: 8px 0 0; color: var(--muted); font-size: 13px; min-height: 1.5em; }
   .role textarea { margin-top: 8px; min-height: 64px; }
@@ -179,6 +184,7 @@
 </aside>
 
 <main>
+  <div class="problem" id="problem" hidden></div>
   <section class="cards" aria-label="The two AIs">
     <div class="card claude">
       <h3>Claude <span class="pill" id="claude-pill">Checking</span></h3>
@@ -243,9 +249,17 @@
   // ---- small helpers ----
   const $ = (id) => document.getElementById(id);
   const TOKEN = document.querySelector("meta[name=token]").content;
-  const api = (path, options = {}) => fetch(path, {
-    ...options, headers: { ...(options.headers || {}), "X-Auth-Token": TOKEN },
-  }).then(r => r.json());
+  const api = async (path, options = {}) => {
+    const r = await fetch(path, { ...options, headers: { ...(options.headers || {}), "X-Auth-Token": TOKEN } });
+    if (!r.ok && r.status !== 400) throw new Error(`${path} answered ${r.status}`);
+    return r.json();
+  };
+  function showProblem(err) {
+    // Most likely cause: the server window is running an older version of the harness.
+    $("problem").hidden = false;
+    $("problem").textContent = "The page could not load part of its data (" + err.message + "). " +
+      "If you just updated the harness, close the launcher window and double-click Start-Harness.cmd again, then reload this page.";
+  }
   let current = null;        // the run being shown
   let currentData = null;    // its latest details from the server
   let activeTab = "merged";
@@ -444,9 +458,9 @@
   }
 
   // ---- first paint ----
-  loadStatus();
-  loadSettings();
-  loadRuns();
+  loadStatus().catch(showProblem);
+  loadSettings().catch(showProblem);
+  loadRuns().catch(showProblem);
 </script>
 </body>
 </html>

@@ -19,6 +19,8 @@ so loopback alone is not enough):
 import argparse
 import json
 import secrets
+import socket
+import sys
 import threading
 import time
 import webbrowser
@@ -206,6 +208,18 @@ def run_details(run_id):
 # HTTP
 # ---------------------------------------------------------------------------
 
+class Server(ThreadingHTTPServer):
+    """A server that insists on having its port to itself. Python's default
+    lets a second copy bind the same port on Windows, and then the old copy
+    keeps answering; this makes the second copy fail with a clear message."""
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):          # Windows only
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 class Handler(BaseHTTPRequestHandler):
     """Routes: the page itself plus a few small JSON endpoints."""
 
@@ -318,7 +332,12 @@ def main():
     args = parser.parse_args()
     set_port(args.port)
 
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    try:
+        server = Server((HOST, PORT), Handler)
+    except OSError:
+        print(f"Port {PORT} is already in use. Another dashboard window is probably open:")
+        print("close it first, or start this one with --port <another number>.")
+        sys.exit(1)
     url = f"http://{HOST}:{PORT}/"
     print(f"AI team dashboard running at {url}  (Ctrl+C to stop)")
     if args.open:
