@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Harness-local Codex home (holds a login token copy, never commit)
+.codex-home/
+
+# Run outputs
+runs/
