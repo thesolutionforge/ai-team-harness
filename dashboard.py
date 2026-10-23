@@ -332,6 +332,13 @@ def main():
     args = parser.parse_args()
     set_port(args.port)
 
+    # First run on this computer: create the Codex settings folder, then say
+    # who is signed in so a newcomer knows what to do next.
+    if conductor.ensure_codex_home():
+        print("First run: created .codex-home with the harness Codex settings.")
+    for who, status in conductor.check_auth().items():
+        print(f"{'Claude' if who == 'claude' else 'GPT':6} {status['detail']}")
+
     try:
         server = Server((HOST, PORT), Handler)
     except OSError:

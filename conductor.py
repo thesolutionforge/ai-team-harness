@@ -40,6 +40,22 @@ ROLES_FILE = HERE / "roles.json"
 # plugins and hooks never load. Codex reads this from the CODEX_HOME variable.
 CODEX_HOME = HERE / ".codex-home"
 
+# Written into a fresh .codex-home the first time the harness runs on a computer.
+CODEX_CONFIG = """\
+# Codex settings used ONLY by the AI team harness.
+# Kept separate from the Codex desktop app's config (~/.codex) via the CODEX_HOME
+# environment variable, so none of the app's MCP servers, plugins or hooks load here.
+# No mcp_servers, no plugins: Codex just answers the task.
+
+# Model and thinking depth. Change these if your ChatGPT plan offers different models.
+model = "gpt-6-astra"
+model_reasoning_effort = "high"
+"""
+
+# What to tell someone who is not signed in yet.
+CLAUDE_SIGNIN_HELP = "Not signed in. In a terminal, run: claude auth login"
+CODEX_SIGNIN_HELP = "Not signed in. Double-click Sign-In-Codex.cmd and sign in with your ChatGPT account."
+
 # Where the Codex installer puts codex.exe. Used as a fallback when the
 # program that launched us has an old PATH (e.g. an app opened before install).
 EXTRA_TOOL_DIRS = [Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "OpenAI" / "Codex" / "bin"]
@@ -153,8 +169,19 @@ def find_tool(name):
     return path
 
 
+def ensure_codex_home():
+    """Create .codex-home with the harness settings if it is missing (first run
+    on a new computer). Returns True if it was created just now."""
+    if (CODEX_HOME / "config.toml").exists():
+        return False
+    CODEX_HOME.mkdir(exist_ok=True)
+    (CODEX_HOME / "config.toml").write_text(CODEX_CONFIG, encoding="utf-8")
+    return True
+
+
 def codex_env():
     """Environment for Codex: same as ours, plus its private settings folder."""
+    ensure_codex_home()
     return dict(os.environ, CODEX_HOME=str(CODEX_HOME))
 
 
@@ -230,7 +257,7 @@ def check_auth():
             detail = f"Signed in as {info.get('email', 'unknown')}" + (f" ({plan} plan)" if plan else "")
             result["claude"] = {"ok": True, "detail": detail}
         else:
-            result["claude"] = {"ok": False, "detail": "Not signed in. Run: claude auth login"}
+            result["claude"] = {"ok": False, "detail": CLAUDE_SIGNIN_HELP}
     except Exception as e:  # tool missing, timeout, bad JSON...
         result["claude"] = {"ok": False, "detail": f"Check failed: {e}"}
 
@@ -242,7 +269,7 @@ def check_auth():
         if proc.returncode == 0 and "logged in" in text.lower() and "not logged" not in text.lower():
             result["gpt"] = {"ok": True, "detail": f"{text}. Model {codex_model()}"}
         else:
-            result["gpt"] = {"ok": False, "detail": "Not signed in. Run: codex login"}
+            result["gpt"] = {"ok": False, "detail": CODEX_SIGNIN_HELP}
     except Exception as e:
         result["gpt"] = {"ok": False, "detail": f"Check failed: {e}"}
 
@@ -470,6 +497,12 @@ def main():
 
     # Windows consoles may not be UTF-8; make sure accents and quotes print fine.
     sys.stdout.reconfigure(encoding="utf-8")
+
+    # Stop early with clear instructions if either AI is not signed in.
+    status = check_auth()
+    problems = [f"{who}: {s['detail']}" for who, s in status.items() if not s["ok"]]
+    if problems:
+        sys.exit("\n".join(problems))
 
     roles = {"claude": role_from_name(args.claude_role), "gpt": role_from_name(args.gpt_role)}
     print(f"Mode: {args.mode}. Claude as {roles['claude']['name']}, Codex as {roles['gpt']['name']}.")
