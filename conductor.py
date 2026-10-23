@@ -5,9 +5,13 @@ Sends one task to Claude and to Codex at the same time, waits for both
 (with a timeout), asks Claude to merge the two answers, and saves everything
 under runs/<date-time>/.
 
+Each AI can be given a role (see roles.json). The role text is put at the
+start of that AI's prompt. The merger is told the role behind each answer,
+but never which AI wrote it.
+
 Used two ways:
-  - from the command line:  python conductor.py "some task"
-  - imported by dashboard.py, which calls check_auth() and run_task().
+  - from the command line:  python conductor.py "some task" --claude-role Strategist
+  - imported by dashboard.py, which calls check_auth(), load_roles() and run_task().
 """
 
 import argparse
@@ -25,6 +29,7 @@ from pathlib import Path
 # Folder this script lives in. Everything else is relative to it.
 HERE = Path(__file__).resolve().parent
 RUNS_DIR = HERE / "runs"
+ROLES_FILE = HERE / "roles.json"
 
 # Codex gets its own settings folder so the desktop app's MCP servers,
 # plugins and hooks never load. Codex reads this from the CODEX_HOME variable.
@@ -43,17 +48,19 @@ HARNESS_NOTE = (
 )
 
 # Template for the merge request. The two answers are labelled A and B only,
-# so the merger does not know which AI wrote which.
+# so the merger does not know which AI wrote which. {label_a} / {label_b}
+# carry the role, e.g. "Answer A (role: Strategist)".
 MERGE_PROMPT = """\
 Two assistants were given the same task. Combine their answers.
+Each answer notes the role its author was asked to play, if any.
 
 ## Task
 {task}
 
-## Answer A
+## {label_a}
 {answer_a}
 
-## Answer B
+## {label_b}
 {answer_b}
 
 ## What to write
@@ -98,6 +105,40 @@ def claude_command():
         "--strict-mcp-config",
         "--append-system-prompt", HARNESS_NOTE,
     ]
+
+
+# ---------------------------------------------------------------------------
+# Roles
+# ---------------------------------------------------------------------------
+
+def load_roles():
+    """Preset roles from roles.json as {name: instruction}. Keys starting
+    with "_" are comments for humans and are skipped."""
+    data = json.loads(ROLES_FILE.read_text(encoding="utf-8"))
+    return {name: text for name, text in data.items() if not name.startswith("_")}
+
+
+def no_role():
+    """The default: no role, so the prompt is just the task."""
+    return {"name": "General", "text": ""}
+
+
+def role_from_name(name):
+    """Look a preset up by name; unknown names fall back to General."""
+    return {"name": name, "text": load_roles().get(name, "")}
+
+
+def with_role(task, role):
+    """Put the role instruction (if any) at the start of the prompt."""
+    text = (role or {}).get("text", "").strip()
+    return f"Your role: {text}\n\nTask:\n{task}" if text else task
+
+
+def role_label(role):
+    """Short tag for the merge prompt and the merged.md footer, e.g. '(role: Critic)'.
+    Empty for General so the prompt reads exactly as before."""
+    name = (role or {}).get("name", "General")
+    return f" (role: {name})" if (role or {}).get("text", "").strip() else ""
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +207,7 @@ def new_run_dir():
 
 def wait_for(name, process, deadline, report, send=None):
     """Wait for a process until the deadline. `send` is optional text for its
-    stdin (used for the long merge prompt). Returns (stdout, stderr, status)."""
+    stdin (the task or the merge prompt). Returns (stdout, stderr, status)."""
     report(name, "working")
     remaining = max(1, deadline - time.monotonic())
     try:
@@ -180,25 +221,25 @@ def wait_for(name, process, deadline, report, send=None):
     return out, err, status
 
 
-def ask_claude(task, run_dir, deadline, report):
+def ask_claude(prompt, run_dir, deadline, report):
     """Round 1, Claude: answer comes back on stdout, saved to claude.md.
-    The task goes in through stdin, so a task starting with "-" is never
+    The prompt goes in through stdin, so text starting with "-" is never
     mistaken for a command-line flag."""
     process = subprocess.Popen(claude_command(), stdin=subprocess.PIPE, **PROC_OPTS)
-    out, err, status = wait_for("claude", process, deadline, report, send=task)
+    out, err, status = wait_for("claude", process, deadline, report, send=prompt)
     answer = out.strip() or f"(no answer: {status})"
     (run_dir / "claude.md").write_text(answer + "\n", encoding="utf-8")
     (run_dir / "claude.log").write_text(err, encoding="utf-8")
     return answer, status
 
 
-def ask_codex(task, run_dir, deadline, report):
+def ask_codex(prompt, run_dir, deadline, report):
     """Round 1, Codex: stdout is noisy, so it writes its final answer to gpt.md
     (-o). --ephemeral means it does not save a resumable session."""
     gpt_file = run_dir / "gpt.md"
-    cmd = [find_tool("codex"), "exec", "--ephemeral", "-o", str(gpt_file)]   # task comes via stdin
+    cmd = [find_tool("codex"), "exec", "--ephemeral", "-o", str(gpt_file)]   # prompt comes via stdin
     process = subprocess.Popen(cmd, env=codex_env(), stdin=subprocess.PIPE, **PROC_OPTS)
-    out, err, status = wait_for("gpt", process, deadline, report, send=task)
+    out, err, status = wait_for("gpt", process, deadline, report, send=prompt)
     if gpt_file.exists() and gpt_file.read_text(encoding="utf-8").strip():
         answer = gpt_file.read_text(encoding="utf-8").strip()
     else:
@@ -208,17 +249,22 @@ def ask_codex(task, run_dir, deadline, report):
     return answer, status
 
 
-def merge_answers(task, claude_answer, gpt_answer, run_dir, timeout, report):
+def merge_answers(task, claude_answer, gpt_answer, roles, run_dir, timeout, report):
     """Round 2: ask Claude to combine the two answers. Which one is A and which
     is B is chosen at random each run, so neither AI always sits first.
-    The mapping is appended to merged.md AFTER merging; the merger never sees it."""
+    The merger sees each answer's role but not its author. The real mapping
+    is appended to merged.md AFTER merging."""
+    claude_tag, gpt_tag = role_label(roles["claude"]), role_label(roles["gpt"])
     if random.random() < 0.5:
-        a, b, mapping = claude_answer, gpt_answer, "Answer A = Claude, Answer B = GPT"
+        a, b = (claude_answer, claude_tag), (gpt_answer, gpt_tag)
+        mapping = f"Answer A = Claude{claude_tag}, Answer B = GPT{gpt_tag}"
     else:
-        a, b, mapping = gpt_answer, claude_answer, "Answer A = GPT, Answer B = Claude"
-    prompt = MERGE_PROMPT.format(task=task, answer_a=a, answer_b=b)
+        a, b = (gpt_answer, gpt_tag), (claude_answer, claude_tag)
+        mapping = f"Answer A = GPT{gpt_tag}, Answer B = Claude{claude_tag}"
+    prompt = MERGE_PROMPT.format(task=task,
+                                 label_a="Answer A" + a[1], answer_a=a[0],
+                                 label_b="Answer B" + b[1], answer_b=b[0])
 
-    # The prompt is long, so it goes in through stdin instead of the command line.
     process = subprocess.Popen(claude_command(), stdin=subprocess.PIPE, **PROC_OPTS)
     deadline = time.monotonic() + timeout
     out, err, status = wait_for("merge", process, deadline, report, send=prompt)
@@ -228,20 +274,27 @@ def merge_answers(task, claude_answer, gpt_answer, run_dir, timeout, report):
     return merged, status
 
 
-def run_task(task, timeout=300, report=None, run_dir=None):
+def run_task(task, timeout=300, report=None, run_dir=None, roles=None):
     """The whole pipeline. `report(step, status)` is called as things progress
-    (step is "claude", "gpt" or "merge"). Returns the run folder."""
+    (step is "claude", "gpt" or "merge"). `roles` is {"claude": role, "gpt": role}
+    where each role is {"name": ..., "text": ...}; missing means General.
+    Returns the run folder."""
     report = report or (lambda step, status: None)
     run_dir = run_dir or new_run_dir()
+    roles = {"claude": (roles or {}).get("claude") or no_role(),
+             "gpt": (roles or {}).get("gpt") or no_role()}
     (run_dir / "task.md").write_text(task + "\n", encoding="utf-8")
+    (run_dir / "roles-used.json").write_text(json.dumps(roles, indent=2), encoding="utf-8")
 
-    # Round 1: both AIs at once. Each runs in its own thread so the slow one
-    # never blocks the fast one, and both share the same deadline.
+    # Round 1: both AIs at once, each with its own role in front of the task.
+    # Each runs in its own thread so the slow one never blocks the fast one.
     deadline = time.monotonic() + timeout
     results = {}
     threads = [
-        threading.Thread(target=lambda: results.update(claude=ask_claude(task, run_dir, deadline, report))),
-        threading.Thread(target=lambda: results.update(gpt=ask_codex(task, run_dir, deadline, report))),
+        threading.Thread(target=lambda: results.update(
+            claude=ask_claude(with_role(task, roles["claude"]), run_dir, deadline, report))),
+        threading.Thread(target=lambda: results.update(
+            gpt=ask_codex(with_role(task, roles["gpt"]), run_dir, deadline, report))),
     ]
     for t in threads:
         t.start()
@@ -252,7 +305,7 @@ def run_task(task, timeout=300, report=None, run_dir=None):
 
     # Round 2: merge, but only if both answers actually arrived.
     if claude_status == "ok" and gpt_status == "ok":
-        merge_answers(task, claude_answer, gpt_answer, run_dir, timeout, report)
+        merge_answers(task, claude_answer, gpt_answer, roles, run_dir, timeout, report)
     else:
         (run_dir / "merged.md").write_text(
             "(merge skipped: one of the answers failed or timed out)\n", encoding="utf-8")
@@ -269,13 +322,17 @@ def main():
     parser.add_argument("task", help="The task to send to both AIs")
     parser.add_argument("--timeout", type=int, default=300,
                         help="Seconds to wait for each step (default 300)")
+    parser.add_argument("--claude-role", default="General", help="Preset role name from roles.json")
+    parser.add_argument("--gpt-role", default="General", help="Preset role name from roles.json")
     args = parser.parse_args()
 
     # Windows consoles may not be UTF-8; make sure accents and quotes print fine.
     sys.stdout.reconfigure(encoding="utf-8")
 
-    print("Starting Claude and Codex...")
-    run_dir = run_task(args.task, args.timeout, report=lambda step, status: print(f"  {step}: {status}"))
+    roles = {"claude": role_from_name(args.claude_role), "gpt": role_from_name(args.gpt_role)}
+    print(f"Starting Claude ({roles['claude']['name']}) and Codex ({roles['gpt']['name']})...")
+    run_dir = run_task(args.task, args.timeout, roles=roles,
+                       report=lambda step, status: print(f"  {step}: {status}"))
     print("\n=== MERGED ===\n" + (run_dir / "merged.md").read_text(encoding="utf-8"))
     print(f"Saved to {run_dir}")
 

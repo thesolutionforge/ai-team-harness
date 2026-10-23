@@ -8,3 +8,6 @@ __pycache__/
 
 # Run outputs
 runs/
+
+# Dashboard memory of your last role choices
+settings.json

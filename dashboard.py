@@ -5,8 +5,9 @@ Listens ONLY on 127.0.0.1, so nothing else on the network can reach it.
 All the real work (running Claude, Codex and the merge) lives in conductor.py;
 this file just serves the page and answers its requests.
 
-    python dashboard.py          # start the server
-    python dashboard.py --open   # start and open the page in your browser
+    python dashboard.py              # start the server on port 8765
+    python dashboard.py --open       # start and open the page in your browser
+    python dashboard.py --port 8766  # use another port (e.g. a second copy)
 
 Security notes (a web page you visit elsewhere can still talk to 127.0.0.1,
 so loopback alone is not enough):
@@ -15,9 +16,9 @@ so loopback alone is not enough):
   - the page gets a Content-Security-Policy so only our own script runs.
 """
 
+import argparse
 import json
 import secrets
-import sys
 import threading
 import time
 import webbrowser
@@ -30,21 +31,71 @@ HOST = "127.0.0.1"          # loopback only: never reachable from other machines
 PORT = 8765
 HERE = Path(__file__).resolve().parent
 PAGE = HERE / "dashboard.html"
+SETTINGS = HERE / "settings.json"   # remembers your last role choices
 
 # New random token each time the server starts. The page receives it in a
 # <meta> tag and sends it back with every API call. Other sites never see it.
 TOKEN = secrets.token_urlsafe(32)
 
 # Only these addresses may appear in the Host / Origin headers.
-ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
-ALLOWED_ORIGINS = {f"http://{h}" for h in ALLOWED_HOSTS}
+# (Filled in by set_port(), because the port can be changed with --port.)
+ALLOWED_HOSTS = set()
+ALLOWED_ORIGINS = set()
+
+
+def set_port(port):
+    """Choose the port and update the Host/Origin allow-lists to match."""
+    global PORT, ALLOWED_HOSTS, ALLOWED_ORIGINS
+    PORT = port
+    ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
+    ALLOWED_ORIGINS = {f"http://{h}" for h in ALLOWED_HOSTS}
+
+
+set_port(PORT)
+
+MAX_ROLE_TEXT = 2000        # characters allowed in a custom role description
 
 # Progress of runs started from the page, keyed by run folder name.
 # Each entry: {"task": str, "steps": {"claude": {...}, "gpt": {...}, "merge": {...}}, "done": bool}
 LIVE = {}
 
 
-def start_run(task, timeout):
+# ---------------------------------------------------------------------------
+# Roles and settings
+# ---------------------------------------------------------------------------
+
+def load_settings():
+    """Your remembered choices, or defaults (both General) the first time."""
+    try:
+        return json.loads(SETTINGS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"roles": {"claude": conductor.no_role(), "gpt": conductor.no_role()}}
+
+
+def save_settings(settings):
+    SETTINGS.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+
+
+def clean_role(raw, presets):
+    """Turn whatever the page sent into a safe {"name", "text"} role.
+    Preset names take their text from roles.json; "Custom" keeps the typed
+    text (trimmed and capped); anything else becomes General."""
+    if not isinstance(raw, dict):
+        return conductor.no_role()
+    name = str(raw.get("name", "General"))[:60]
+    if name == "Custom":
+        text = str(raw.get("text", "")).strip()[:MAX_ROLE_TEXT]
+        return {"name": "Custom", "text": text} if text else conductor.no_role()
+    if name in presets:
+        return {"name": name, "text": presets[name]}
+    return conductor.no_role()
+
+
+# ---------------------------------------------------------------------------
+# Runs
+# ---------------------------------------------------------------------------
+
+def start_run(task, timeout, roles):
     """Create the run folder, then run the pipeline in a background thread
     so the web server stays responsive while the AIs work."""
     run_dir = conductor.new_run_dir()
@@ -63,7 +114,7 @@ def start_run(task, timeout):
 
     def work():
         try:
-            conductor.run_task(task, timeout, report=report, run_dir=run_dir)
+            conductor.run_task(task, timeout, report=report, run_dir=run_dir, roles=roles)
         except Exception as e:                      # e.g. a CLI is missing
             for step in LIVE[run_id]["steps"].values():
                 if step["status"] in ("waiting", "working"):
@@ -78,6 +129,15 @@ def read_file(folder, name):
     """Return a file's text, or None if it does not exist yet."""
     path = folder / name
     return path.read_text(encoding="utf-8") if path.exists() else None
+
+
+def read_roles(folder):
+    """Roles saved with a run, or None for runs made before roles existed."""
+    text = read_file(folder, "roles-used.json")
+    try:
+        return json.loads(text) if text else None
+    except ValueError:
+        return None
 
 
 def list_runs():
@@ -101,12 +161,17 @@ def run_details(run_id):
     return {
         "id": run_id,
         "task": read_file(folder, "task.md"),
+        "roles": read_roles(folder),
         "claude": read_file(folder, "claude.md"),
         "gpt": read_file(folder, "gpt.md"),
         "merged": read_file(folder, "merged.md"),
         "live": LIVE.get(run_id),      # None for runs from before this server started
     }
 
+
+# ---------------------------------------------------------------------------
+# HTTP
+# ---------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
     """Routes: the page itself plus a few small JSON endpoints."""
@@ -154,6 +219,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def read_json_body(self):
+        """The POST body as a dict, or None if it is not JSON."""
+        if not self.headers.get("Content-Type", "").startswith("application/json"):
+            return None
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            return json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            return None
+
     def do_GET(self):
         if not self.request_allowed():
             return self.send_json({"error": "forbidden"}, 403)
@@ -161,6 +236,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_page()
         elif self.path == "/api/status":
             self.send_json(conductor.check_auth())
+        elif self.path == "/api/roles":
+            # Presets for the dropdowns plus your last choices.
+            self.send_json({"presets": conductor.load_roles(), "last": load_settings()["roles"]})
         elif self.path == "/api/runs":
             self.send_json(list_runs())
         elif self.path.startswith("/api/runs/"):
@@ -177,14 +255,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "forbidden"}, 403)
         if self.path == "/api/run":
             # Insisting on JSON means a cross-site form post can never match.
-            if not self.headers.get("Content-Type", "").startswith("application/json"):
+            data = self.read_json_body()
+            if data is None:
                 return self.send_json({"error": "expected JSON"}, 415)
-            length = int(self.headers.get("Content-Length", 0))
-            data = json.loads(self.rfile.read(length) or b"{}")
-            task = (data.get("task") or "").strip()
+            task = str(data.get("task") or "").strip()
             if not task:
                 return self.send_json({"error": "Type a task first."}, 400)
-            run_id = start_run(task, int(data.get("timeout") or 300))
+            presets = conductor.load_roles()
+            raw = data.get("roles") or {}
+            roles = {"claude": clean_role(raw.get("claude"), presets),
+                     "gpt": clean_role(raw.get("gpt"), presets)}
+            save_settings({"roles": roles})          # remember for next time
+            run_id = start_run(task, int(data.get("timeout") or 300), roles)
             self.send_json({"id": run_id})
         else:
             self.send_json({"error": "not found"}, 404)
@@ -194,10 +276,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Local web page for the AI team harness.")
+    parser.add_argument("--port", type=int, default=PORT, help=f"port to listen on (default {PORT})")
+    parser.add_argument("--open", action="store_true", help="open the page in your browser")
+    args = parser.parse_args()
+    set_port(args.port)
+
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     url = f"http://{HOST}:{PORT}/"
     print(f"AI team dashboard running at {url}  (Ctrl+C to stop)")
-    if "--open" in sys.argv:
+    if args.open:
         webbrowser.open(url)
     try:
         server.serve_forever()

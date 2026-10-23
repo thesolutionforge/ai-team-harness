@@ -4,8 +4,8 @@
     {
       "name": "dashboard",
       "runtimeExecutable": "python",
-      "runtimeArgs": ["-u", "dashboard.py"],
-      "port": 8765
+      "runtimeArgs": ["-u", "dashboard.py", "--port", "8766"],
+      "port": 8766
     }
   ]
 }

@@ -37,7 +37,8 @@
     display: grid; grid-template-columns: 260px 1fr; min-height: 100vh;
   }
   h1, h2, h3 { margin: 0; font-weight: 600; letter-spacing: -0.01em; }
-  button { font: inherit; cursor: pointer; }
+  button, select, textarea { font: inherit; }
+  button { cursor: pointer; }
   :focus-visible { outline: 2px solid var(--merge); outline-offset: 2px; }
 
   /* ---- sidebar: recent runs ---- */
@@ -71,11 +72,23 @@
   .pill.ok { color: var(--ok); background: rgba(111,207,142,.12); }
   .pill.bad { color: var(--bad); background: rgba(240,122,122,.12); }
 
+  /* role selector inside each card */
+  .role { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+  .role label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; }
+  select {
+    width: 100%; color: var(--text); background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 6px; padding: 7px 10px;
+  }
+  select:focus { border-color: var(--who); outline: none; }
+  .role .desc { margin: 8px 0 0; color: var(--muted); font-size: 13px; min-height: 1.5em; }
+  .role textarea { margin-top: 8px; min-height: 64px; }
+  .role textarea:focus { border-color: var(--who); }
+
   /* ---- task box ---- */
   .task { background: var(--panel); border-radius: var(--radius); padding: 16px 18px; margin-bottom: 22px; }
   .task label { display: block; font-size: 14px; font-weight: 500; margin-bottom: 8px; }
   textarea {
-    width: 100%; min-height: 84px; resize: vertical; font: inherit; color: var(--text);
+    width: 100%; min-height: 84px; resize: vertical; color: var(--text);
     background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px;
   }
   textarea:focus { border-color: var(--muted); outline: none; }
@@ -96,6 +109,7 @@
   }
   .lane .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--line); }
   .lane .name { font-weight: 500; font-size: 14px; }
+  .lane .name .as { font-weight: 400; color: var(--muted); }   /* the role, e.g. "as Strategist" */
   .lane .state { grid-column: 2; color: var(--muted); font-size: 13px; }
   .lane.claude .dot.working, .lane.claude .dot.ok { background: var(--claude); }
   .lane.gpt .dot.working, .lane.gpt .dot.ok { background: var(--gpt); }
@@ -149,14 +163,26 @@
 </aside>
 
 <main>
-  <section class="cards" aria-label="Sign-in status">
+  <section class="cards" aria-label="The two AIs">
     <div class="card claude">
       <h3>Claude <span class="pill" id="claude-pill">Checking</span></h3>
       <p id="claude-detail">Looking up sign-in status.</p>
+      <div class="role">
+        <label for="claude-role">Role</label>
+        <select id="claude-role" data-who="claude"></select>
+        <p class="desc" id="claude-role-desc"></p>
+        <textarea id="claude-role-custom" placeholder="Describe the role in a sentence or two." hidden></textarea>
+      </div>
     </div>
     <div class="card gpt">
       <h3>GPT <span class="pill" id="gpt-pill">Checking</span></h3>
       <p id="gpt-detail">Looking up sign-in status.</p>
+      <div class="role">
+        <label for="gpt-role">Role</label>
+        <select id="gpt-role" data-who="gpt"></select>
+        <p class="desc" id="gpt-role-desc"></p>
+        <textarea id="gpt-role-custom" placeholder="Describe the role in a sentence or two." hidden></textarea>
+      </div>
     </div>
   </section>
 
@@ -170,8 +196,8 @@
   </section>
 
   <section class="lanes" aria-label="Progress">
-    <div class="lane claude"><span class="dot" id="lane-claude-dot"></span><span class="name">Claude</span><span class="state" id="lane-claude">Waiting</span></div>
-    <div class="lane gpt"><span class="dot" id="lane-gpt-dot"></span><span class="name">GPT</span><span class="state" id="lane-gpt">Waiting</span></div>
+    <div class="lane claude"><span class="dot" id="lane-claude-dot"></span><span class="name">Claude<span class="as" id="lane-claude-role"></span></span><span class="state" id="lane-claude">Waiting</span></div>
+    <div class="lane gpt"><span class="dot" id="lane-gpt-dot"></span><span class="name">GPT<span class="as" id="lane-gpt-role"></span></span><span class="state" id="lane-gpt">Waiting</span></div>
     <div class="lane merge"><span class="dot" id="lane-merge-dot"></span><span class="name">Merge</span><span class="state" id="lane-merge">Waiting</span></div>
   </section>
 
@@ -194,6 +220,7 @@
   let currentData = null;    // its latest details from the server
   let activeTab = "merged";
   let ticker = null;         // repaints the elapsed seconds while a run is working
+  let presets = {};          // role name -> instruction text, from roles.json
 
   // ---- sign-in cards ----
   async function loadStatus() {
@@ -204,6 +231,38 @@
       $(who + "-pill").className = "pill " + (s.ok ? "ok" : "bad");
       $(who + "-detail").textContent = s.detail;
     }
+  }
+
+  // ---- roles ----
+  async function loadRoles() {
+    const data = await api("/api/roles");
+    presets = data.presets;
+    for (const who of ["claude", "gpt"]) {
+      const select = $(who + "-role");
+      select.innerHTML = "";
+      for (const name of [...Object.keys(presets), "Custom"]) {
+        const opt = document.createElement("option");
+        opt.value = name; opt.textContent = name;
+        select.appendChild(opt);
+      }
+      // Restore the last choice (defaults to General on first use).
+      const last = data.last[who] || { name: "General", text: "" };
+      select.value = presets[last.name] !== undefined || last.name === "Custom" ? last.name : "General";
+      if (last.name === "Custom") $(who + "-role-custom").value = last.text;
+      select.onchange = () => showRoleText(who);
+      showRoleText(who);
+    }
+  }
+  function showRoleText(who) {
+    // Show the preset's instruction under the dropdown, or the custom box.
+    const name = $(who + "-role").value;
+    const custom = name === "Custom";
+    $(who + "-role-custom").hidden = !custom;
+    $(who + "-role-desc").textContent = custom ? "" : (presets[name] || "No role: the task is sent as is.");
+  }
+  function chosenRole(who) {
+    const name = $(who + "-role").value;
+    return { name, text: name === "Custom" ? $(who + "-role-custom").value.trim() : (presets[name] || "") };
   }
 
   // ---- recent runs sidebar ----
@@ -234,7 +293,8 @@
     const task = $("task").value.trim();
     if (!task) { $("task").focus(); return; }
     $("run").disabled = true;
-    const res = await api("/api/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ task }) });
+    const body = { task, roles: { claude: chosenRole("claude"), gpt: chosenRole("gpt") } };
+    const res = await api("/api/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
     if (res.error) { alert(res.error); $("run").disabled = false; return; }
     current = res.id;
     loadRuns();
@@ -273,6 +333,11 @@
     clearInterval(ticker);
     const live = data.live;
     let anyWorking = false;
+    // The role each AI played in this run, shown next to its name.
+    for (const who of ["claude", "gpt"]) {
+      const role = data.roles && data.roles[who];
+      $("lane-" + who + "-role").textContent = role && role.text ? " as " + role.name : "";
+    }
     for (const step of ["claude", "gpt", "merge"]) {
       const dot = $("lane-" + step + "-dot"), text = $("lane-" + step);
       let status, started, ended;
@@ -320,6 +385,7 @@
 
   // ---- first paint ----
   loadStatus();
+  loadRoles();
   loadRuns();
 </script>
 </body>
